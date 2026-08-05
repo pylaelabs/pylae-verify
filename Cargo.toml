@@ -1,0 +1,20 @@
+[package]
+name = "pylae-verify"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Independent, open-source verifier for Pylae audit-evidence bundles"
+repository = "https://github.com/pylaelabs/pylae-verify"
+
+# Clean-room implementation from the published Pylae Evidence Format
+# Specification. It shares no source with the Pylae product; it depends only on
+# widely-audited, standard cryptography crates.
+[dependencies]
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
+[profile.release]
+lto = true
+strip = true

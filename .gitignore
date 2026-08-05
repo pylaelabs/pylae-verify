@@ -1,0 +1,12 @@
+# Rust build output
+/target/
+
+# Backtraces
+*.rs.bk
+
+# Local env / editor
+.env
+.DS_Store
+*.swp
+.idea/
+.vscode/
