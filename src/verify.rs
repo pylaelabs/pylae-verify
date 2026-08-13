@@ -348,15 +348,35 @@ fn recompute_leaf(
     }
 }
 
-/// Resolve an action's params_hash. For an erased action, use the tombstone's
-/// `original_params_hash` iff it verifies against both stored copies (spec §6);
-/// otherwise hash the current (possibly redacted) params, which surfaces the
-/// erased leaf as a mismatch — the conservative outcome.
+/// Resolve an action's params_hash, by the normative rule of spec §9:
+///
+///  1. `request_params_truncated` → `request_params_raw_hash`, the pre-truncation
+///     commitment the leaf carries. Past the producer's threshold `request_params`
+///     holds a `{"truncated": true, "size": N}` marker, so re-hashing it cannot
+///     reproduce the leaf.
+///  2. erased with a tombstone that verifies against both stored copies (spec §6)
+///     → the raw commitment if present, else the tombstone's `original_params_hash`.
+///     The raw one is more faithful: a truncated action's tombstone commits the
+///     marker's hash.
+///  3. otherwise hash the current params.
+///
+/// Case 3 is deliberately not served from the commitment column. Re-hashing the
+/// stored payload is what catches an out-of-band rewrite of `request_params`;
+/// preferring the column unconditionally would accept a forged payload under a
+/// leaf that still verifies.
+///
+/// Selection is independent of the tombstone verdict: that verdict is an integrity
+/// signal about the erasure record, reported by the erasure pass (spec §6).
 fn resolve_params_hash(
     a: &ActionRow,
     era_by_target: &HashMap<&str, &ErasureRow>,
     _r: &mut Report,
 ) -> String {
+    if a.request_params_truncated.unwrap_or(false) {
+        if let Some(raw) = a.request_params_raw_hash.as_deref() {
+            return raw.to_string();
+        }
+    }
     if let (Some(marker), Some(e)) = (a.redacted_marker_hash.as_deref(), era_by_target.get(a.id.as_str())) {
         let th = tombstone_hash(
             &e.target_action_id,
@@ -366,7 +386,10 @@ fn resolve_params_hash(
             &e.original_params_hash,
         );
         if th == e.tombstone_hash && th == marker {
-            return e.original_params_hash.clone();
+            return a
+                .request_params_raw_hash
+                .clone()
+                .unwrap_or_else(|| e.original_params_hash.clone());
         }
     }
     canonical_params_hash(a.request_params.as_ref())

@@ -46,6 +46,11 @@ pub struct ActionRow {
     pub tool_name: Option<String>,
     #[serde(default)]
     pub request_params: Option<Value>,
+    /// The hash of the params as they arrived, before the producer applied any
+    /// truncation — the value the leaf committed (spec §9, precedence rule 1).
+    /// Absent on rows written before the producer recorded it.
+    #[serde(default)]
+    pub request_params_raw_hash: Option<String>,
     pub decision: String,
     #[serde(default)]
     pub decision_source: Option<String>,

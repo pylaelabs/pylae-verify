@@ -16,6 +16,96 @@ use pylae_verify::verify;
 
 const VALID: &str = "tests/fixtures/valid-bundle";
 
+/// A second, small fixture carrying the three shapes the demo export does
+/// not: a truncated request payload, a captured response leaf, and a
+/// non-empty snapshot hash. Regenerate with the in-tree generator:
+/// `PYLAE_FIXTURE_OUT=<dir> cargo test --bin pylae emit_conformance_fixture
+/// -- --ignored` in the core repo.
+const TRUNCATED: &str = "tests/fixtures/truncated-bundle";
+
+#[test]
+fn truncated_bundle_verifies_via_the_raw_commitment() {
+    let b = Bundle::load(Path::new(TRUNCATED)).expect("load truncated bundle");
+
+    // Premise guards: this fixture exists solely to exercise shapes the
+    // demo bundle lacks. If it stops carrying them, the test below proves
+    // nothing and must fail loudly rather than pass vacuously.
+    let truncated = b
+        .actions
+        .iter()
+        .find(|a| a.request_params_truncated == Some(true))
+        .expect("fixture must contain a truncated action");
+    assert!(
+        truncated.request_params_raw_hash.is_some(),
+        "a truncated action must carry the pre-truncation commitment"
+    );
+    assert!(
+        b.actions.iter().any(|a| a.response_chain_version.is_some()),
+        "fixture must contain a captured response leaf"
+    );
+    assert!(
+        b.actions
+            .iter()
+            .any(|a| a.snapshot_hash.as_deref().map_or(false, |s| !s.is_empty())),
+        "fixture must contain a non-empty snapshot hash"
+    );
+
+    let r = verify::verify(&b);
+    assert!(
+        r.structural_passed(),
+        "truncated bundle must pass; leaf_mismatches={:?}, blocks={:?}, gaps={:?}, manifest={:?}",
+        r.leaf_mismatches,
+        r.block_problems,
+        r.linkage_gaps,
+        r.manifest_problems
+    );
+}
+
+#[test]
+fn stripping_the_raw_commitment_breaks_the_truncated_leaf() {
+    // Proves the §9 precedence is load-bearing here rather than
+    // incidentally satisfied. With the commitment removed, the only value
+    // left for the truncated action is its `{"truncated":…}` marker, which
+    // cannot reproduce the leaf the producer stamped.
+    let dir = TempBundle::from_dir(TRUNCATED, "strip");
+    let actions = dir.path().join("actions.jsonl");
+    let original = std::fs::read(&actions).expect("read actions.jsonl");
+    let stripped = strip_raw_hash(&original);
+    assert_ne!(
+        original, stripped,
+        "fixture must contain a raw commitment to strip"
+    );
+    std::fs::write(&actions, &stripped).expect("write stripped actions");
+    refix_manifest(dir.path(), "actions.jsonl", &stripped);
+
+    let b = Bundle::load(dir.path()).expect("load stripped bundle");
+    let r = verify::verify(&b);
+
+    assert!(
+        !r.structural_passed(),
+        "a truncated leaf without its commitment must not verify"
+    );
+    assert!(
+        !r.leaf_mismatches.is_empty(),
+        "the failure must be a leaf recompute mismatch, not a manifest problem"
+    );
+}
+
+/// Null out `request_params_raw_hash` on every action row. Harmless for an
+/// untruncated action — its stored payload still re-hashes to the committed
+/// value — so only the truncated leaf loses its only usable source.
+fn strip_raw_hash(content: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8(content.to_vec()).expect("actions.jsonl is utf-8");
+    let mut out = String::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let mut v: serde_json::Value = serde_json::from_str(line).expect("action row json");
+        v["request_params_raw_hash"] = serde_json::Value::Null;
+        out.push_str(&v.to_string());
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
 #[test]
 fn valid_bundle_verifies() {
     let b = Bundle::load(Path::new(VALID)).expect("load valid bundle");
@@ -106,12 +196,16 @@ struct TempBundle {
 
 impl TempBundle {
     fn from_valid() -> Self {
+        Self::from_dir(VALID, "tamper")
+    }
+
+    fn from_dir(src: &str, tag: &str) -> Self {
         let mut dir = std::env::temp_dir();
         // Unique per test binary + this test name; no rng needed.
-        dir.push(format!("pylae-verify-tamper-{}", std::process::id()));
+        dir.push(format!("pylae-verify-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp bundle dir");
-        for entry in std::fs::read_dir(VALID).expect("read valid fixture") {
+        for entry in std::fs::read_dir(src).expect("read source fixture") {
             let entry = entry.expect("dir entry");
             if entry.file_type().expect("file type").is_file() {
                 let dest = dir.join(entry.file_name());
