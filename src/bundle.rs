@@ -109,6 +109,29 @@ pub struct EventRow {
     pub event_uid: String,
 }
 
+/// One row of `snapshots.jsonl` (spec §9): the six inputs of
+/// `snapshot_hash` plus the hash they produce, so the construction is
+/// recomputable from the bundle alone.
+#[derive(Debug, Deserialize)]
+pub struct SnapshotRow {
+    pub action_id: String,
+    #[serde(default)]
+    pub chain_version: i64,
+    pub security_posture: Value,
+    pub cost_ceiling: Value,
+    #[serde(default)]
+    pub agent_profile_id: Option<String>,
+    /// In stored order — the preimage writes them as they arrive.
+    #[serde(default)]
+    pub active_policy_ids: Vec<String>,
+    #[serde(default)]
+    pub active_contract_id: Option<String>,
+    pub damage_estimate: Value,
+    pub snapshot_hash: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct BlockRow {
     pub block_number: i64,
@@ -137,6 +160,7 @@ pub struct Bundle {
     pub events: Vec<EventRow>,
     pub blocks: Vec<BlockRow>,
     pub configs: Vec<ConfigRow>,
+    pub snapshots: Vec<SnapshotRow>,
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>, String> {
@@ -163,8 +187,7 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(dir: &Path, name: &str) -> Result<Ve
         if line.trim().is_empty() {
             continue;
         }
-        let row = serde_json::from_str(line)
-            .map_err(|e| format!("{name} line {}: {e}", i + 1))?;
+        let row = serde_json::from_str(line).map_err(|e| format!("{name} line {}: {e}", i + 1))?;
         out.push(row);
     }
     Ok(out)
@@ -185,6 +208,11 @@ impl Bundle {
             events: read_jsonl(dir, "events.jsonl")?,
             blocks: read_jsonl(dir, "blocks.jsonl")?,
             configs: read_jsonl(dir, "config_archive.jsonl")?,
+            // Absent on bundles exported before the file existed. Those
+            // carry no `snapshot_hash` either, so the empty vec is the
+            // truthful reading; a bundle that DOES commit to a snapshot
+            // and ships no row is caught by the verifier, not here.
+            snapshots: read_jsonl(dir, "snapshots.jsonl")?,
         })
     }
 

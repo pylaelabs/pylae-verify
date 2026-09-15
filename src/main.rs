@@ -67,18 +67,23 @@ fn section(title: &str, problems: &[String]) {
 }
 
 fn print_report(b: &Bundle, r: &Report) {
-    println!("pylae-verify {} — structural verification", env!("CARGO_PKG_VERSION"));
+    println!(
+        "pylae-verify {} — structural verification",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("bundle: {}", b.dir.display());
     if !b.identity.tool_version.is_empty() {
         println!("exported by Pylae {}", b.identity.tool_version);
     }
     println!(
-        "leaves: {} (actions {}, erasures {}, events {}) · blocks: {} · config artifacts: {}",
+        "leaves: {} (actions {}, erasures {}, events {}) · blocks: {} · snapshots: {} · \
+         config artifacts: {}",
         r.leaf_count,
         b.actions.len(),
         b.erasures.len(),
         b.events.len(),
         r.block_count,
+        r.snapshot_count,
         b.configs.len(),
     );
     println!("\nLevel 1 — structural (keyless):");
@@ -87,11 +92,27 @@ fn print_report(b: &Bundle, r: &Report) {
         Some(e) => section("genesis", std::slice::from_ref(e)),
         None => section("genesis", &[]),
     }
-    section("bundle manifest (SHA-256 of every file)", &r.manifest_problems);
+    section(
+        "bundle manifest (SHA-256 of every file)",
+        &r.manifest_problems,
+    );
     section("chain linkage (no gaps)", &r.linkage_gaps);
-    section("leaf recomputation (all leaves re-hash)", &r.leaf_mismatches);
-    section("Merkle blocks (roots + actions_count binding)", &r.block_problems);
-    section("tombstone consistency (GDPR erasure)", &r.tombstone_problems);
+    section(
+        "leaf recomputation (all leaves re-hash)",
+        &r.leaf_mismatches,
+    );
+    section(
+        "Merkle blocks (roots + actions_count binding)",
+        &r.block_problems,
+    );
+    section(
+        "tombstone consistency (GDPR erasure)",
+        &r.tombstone_problems,
+    );
+    section(
+        "forensic snapshots (inputs recompute their hash)",
+        &r.snapshot_problems,
+    );
     section("config anchors (content-addressed)", &r.config_problems);
 
     if !r.config_unresolved.is_empty() {
@@ -105,17 +126,23 @@ fn print_report(b: &Bundle, r: &Report) {
     }
 
     println!("\nLevel 2 — attribution (authorship / anti-operator tamper):");
-    println!("  [skip] requires the per-deployment seed; not verifiable by a third party (spec §8, §10)");
+    println!(
+        "  [skip] requires the per-deployment seed; not verifiable by a third party (spec §8, §10)"
+    );
 
     println!();
     if r.structural_passed() {
-        println!("RESULT: OK — structural integrity verified ({} leaves, {} blocks).", r.leaf_count, r.block_count);
+        println!(
+            "RESULT: OK — structural integrity verified ({} leaves, {} blocks).",
+            r.leaf_count, r.block_count
+        );
     } else {
         let issues = r.manifest_problems.len()
             + r.linkage_gaps.len()
             + r.leaf_mismatches.len()
             + r.block_problems.len()
             + r.tombstone_problems.len()
+            + r.snapshot_problems.len()
             + r.config_problems.len()
             + usize::from(r.genesis_error.is_some());
         println!("RESULT: FAILED — {issues} discrepancy(ies) found. This bundle is not intact.");

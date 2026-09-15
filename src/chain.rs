@@ -8,7 +8,11 @@
 //! No Pylae product code is used; only `sha2` via [`crate::canonical`].
 #![allow(dead_code)]
 
-use crate::canonical::{sha256_bytes, sha256_hex, write_i64, write_opt_str, write_str};
+use serde_json::Value;
+
+use crate::canonical::{
+    sha256_bytes, sha256_hex, write_i64, write_opt_str, write_str, write_u32, write_value,
+};
 
 // ── Domain separators (spec §3). ASCII, no length prefix. ───────────────────
 const DS_CHAIN_HASH: &[u8] = b"pylae:chain_hash:v4"; // action + erasure leaves
@@ -16,6 +20,7 @@ const DS_EVENT_CHAIN_HASH: &[u8] = b"pylae:event_chain_hash:v1";
 const DS_RESPONSE_CHAIN_HASH: &[u8] = b"pylae:response_chain_hash:v1";
 const DS_GENESIS: &[u8] = b"pylae:genesis:v2";
 const DS_TOMBSTONE: &[u8] = b"pylae:tombstone:v1";
+const DS_SNAPSHOT: &[u8] = b"pylae:snapshot_hash:v1";
 
 // ── Leaf-kind bytes (second byte of every chain-leaf preimage). ─────────────
 const KIND_ACTION: u8 = 0x00;
@@ -50,12 +55,51 @@ pub fn normalize_timestamp(ts: &str) -> String {
 /// # Errors
 /// Returns `Err` if `fingerprint_hex` is not valid hex.
 pub fn genesis_hash(fingerprint_hex: &str) -> Result<String, String> {
-    let raw = hex::decode(fingerprint_hex)
-        .map_err(|e| format!("invalid seed fingerprint hex: {e}"))?;
+    let raw =
+        hex::decode(fingerprint_hex).map_err(|e| format!("invalid seed fingerprint hex: {e}"))?;
     let mut buf = Vec::with_capacity(DS_GENESIS.len() + raw.len());
     buf.extend_from_slice(DS_GENESIS);
     buf.extend_from_slice(&raw);
     Ok(sha256_hex(&buf))
+}
+
+/// The six inputs of `snapshot_hash` (spec §2.2), as they travel in
+/// `snapshots.jsonl` (§9).
+pub struct SnapshotInputs<'a> {
+    pub security_posture: &'a Value,
+    pub cost_ceiling: &'a Value,
+    pub agent_profile_id: Option<&'a str>,
+    /// **In stored order.** The preimage counts them and then writes each
+    /// one; sorting them here would re-key every leaf that carries a
+    /// snapshot.
+    pub active_policy_ids: &'a [String],
+    pub active_contract_id: Option<&'a str>,
+    pub damage_estimate: &'a Value,
+}
+
+impl SnapshotInputs<'_> {
+    /// `snapshot_hash` (spec §2.2). Field order is fixed; reordering
+    /// re-keys every leaf that carries one.
+    ///
+    /// `damage_estimate` is fed to `write_value` as the object the bundle
+    /// carries, without reshaping — the encoder is type-tagged, so a
+    /// verifier that normalised the object first would compute a different
+    /// value for the same snapshot.
+    #[must_use]
+    pub fn hash(&self) -> String {
+        let mut b = Vec::with_capacity(512);
+        b.extend_from_slice(DS_SNAPSHOT);
+        write_value(&mut b, self.security_posture);
+        write_value(&mut b, self.cost_ceiling);
+        write_opt_str(&mut b, self.agent_profile_id);
+        write_u32(&mut b, self.active_policy_ids.len() as u32);
+        for id in self.active_policy_ids {
+            write_str(&mut b, id);
+        }
+        write_opt_str(&mut b, self.active_contract_id);
+        write_value(&mut b, self.damage_estimate);
+        sha256_hex(&b)
+    }
 }
 
 /// Tombstone hash (spec §6): commits the erasure metadata + original params.
@@ -243,7 +287,11 @@ pub fn merkle_root(leaves: &[&str]) -> Option<[u8; 32]> {
         let mut i = 0;
         while i < level.len() {
             let left = &level[i];
-            let right = if i + 1 < level.len() { &level[i + 1] } else { left };
+            let right = if i + 1 < level.len() {
+                &level[i + 1]
+            } else {
+                left
+            };
             next.push(hash_internal(left, right));
             i += 2;
         }
@@ -274,8 +322,14 @@ mod tests {
 
     #[test]
     fn timestamp_normalization() {
-        assert_eq!(normalize_timestamp("2026-08-02T12:51:10.291757900Z"), "2026-08-02T12:51:10.291757900+00:00");
-        assert_eq!(normalize_timestamp("2026-08-02T12:51:10+00:00"), "2026-08-02T12:51:10+00:00");
+        assert_eq!(
+            normalize_timestamp("2026-08-02T12:51:10.291757900Z"),
+            "2026-08-02T12:51:10.291757900+00:00"
+        );
+        assert_eq!(
+            normalize_timestamp("2026-08-02T12:51:10+00:00"),
+            "2026-08-02T12:51:10+00:00"
+        );
     }
 
     #[test]
@@ -287,7 +341,7 @@ mod tests {
     #[test]
     fn merkle_single_leaf_differs_from_block_root() {
         let leaves = ["aa", "bb"];
-        let refs: Vec<&str> = leaves.iter().copied().collect();
+        let refs: Vec<&str> = leaves.to_vec();
         assert!(merkle_root(&refs).is_some());
         // block root binds the count, so it is not the bare tree root hex
         let br = block_root(&refs, 2).unwrap();
