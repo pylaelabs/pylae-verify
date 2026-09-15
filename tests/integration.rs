@@ -47,7 +47,7 @@ fn the_demo_bundle_verifies() {
         r.config_problems,
         r.manifest_problems
     );
-    assert_eq!(r.leaf_count, 64, "expected 64 leaves");
+    assert_eq!(r.leaf_count, 65, "expected 65 leaves");
     assert_eq!(r.block_count, 2, "expected 2 sealed blocks");
     assert_eq!(r.tombstone_count, 13, "expected 13 erasure tombstones");
     assert!(
@@ -57,8 +57,136 @@ fn the_demo_bundle_verifies() {
     );
     assert_eq!(
         r.config_resolved, 4,
-        "all four anchored referents must re-derive: {:?} / {:?}",
+        "all four archived referents must re-derive: {:?} / {:?}",
         r.config_problems, r.config_unresolved
+    );
+    assert_eq!(
+        (r.config_anchors, r.config_unresolved.len()),
+        (2, 0),
+        "and the two hashes the chain anchors must both be in the archive: {:?}",
+        r.config_unresolved
+    );
+}
+
+/// **Promise:** the anchors come from the chain, not from the archive.
+///
+/// `config_archive.jsonl` cannot say what is missing from it. Checking only
+/// the rows present means checking the producer's choice of what to hand
+/// over — an operator who drops a row drops the evidence that it should
+/// have been there. The `compliance.config_active` leaf is what states the
+/// anchors, and it is a chain leaf so that dropping one is not a silent
+/// edit: this test reads them back out of `events.jsonl`, confirms the
+/// verifier found the same ones, and confirms the archive holds them.
+///
+/// **Kill mutation:** stop reading the anchor leaf — `config_anchors`
+/// drops to zero.
+#[test]
+fn the_anchors_are_read_from_the_chain_not_from_the_archive() {
+    let b = Bundle::load(Path::new(CONFORMANCE)).expect("load conformance bundle");
+
+    let anchor = b
+        .events
+        .iter()
+        .filter(|e| e.event_type == "compliance.config_active")
+        .max_by_key(|e| e.chain_version)
+        .expect("premise: the fixture must carry a config anchor leaf");
+    let manifest_hash = anchor.details["manifest"]["manifest_hash"]
+        .as_str()
+        .expect("premise: the anchor names a manifest hash")
+        .to_string();
+    let rules_fp = anchor.details["rules_fingerprint"]
+        .as_str()
+        .expect("premise: the anchor names a rules fingerprint")
+        .to_string();
+    assert_ne!(
+        manifest_hash, rules_fp,
+        "premise: two distinct anchors, or this counts one twice"
+    );
+    assert!(
+        anchor.signature.is_some(),
+        "premise: the anchor leaf is signed — that is what puts it beyond an operator's edit"
+    );
+
+    let r = verify::verify(&b);
+    assert_eq!(
+        r.config_anchors, 2,
+        "the verifier must find exactly the anchors the leaf names: {:?}",
+        r.config_unresolved
+    );
+    assert!(
+        r.config_unresolved.is_empty(),
+        "and this bundle archives both of them: {:?}",
+        r.config_unresolved
+    );
+}
+
+/// **Promise:** an anchored hash with no row is reported, and is not a
+/// verdict.
+///
+/// Spec §9.2 draws the line here and it is the whole point of the section:
+/// a row that contradicts its own address is a **failure**, because
+/// content-addressing makes the disagreement mean the body was replaced.
+/// An anchor with no row is **informative** — a database predating the
+/// archive has nothing to offer. Collapsing the two in either direction
+/// breaks something: treat the absence as failure and every older
+/// deployment is permanently not-intact; treat it as silence and dropping
+/// a row becomes free.
+///
+/// **Kill mutations:** stop reading the anchor leaf (nothing is reported);
+/// or push the absence into `config_problems` (the verdict below flips).
+#[test]
+fn an_anchored_hash_with_no_row_is_reported_and_is_not_a_verdict() {
+    let dir = TempBundle::from_dir(CONFORMANCE, "anchor");
+    let path = dir.path().join("config_archive.jsonl");
+    let original = std::fs::read(&path).expect("read config_archive.jsonl");
+
+    // Drop the embedded manifest row — the one the anchor names — and
+    // leave every other row untouched, so what remains is self-consistent
+    // and only the comparison against the chain sees the loss.
+    let b = Bundle::load(dir.path()).expect("load");
+    let anchor_hash = b
+        .events
+        .iter()
+        .filter(|e| e.event_type == "compliance.config_active")
+        .max_by_key(|e| e.chain_version)
+        .and_then(|e| e.details["manifest"]["manifest_hash"].as_str())
+        .expect("premise: an anchored manifest hash")
+        .to_string();
+    drop(b);
+
+    let text = String::from_utf8(original).expect("utf-8");
+    let kept: String = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| !l.contains(&format!("\"content_hash\":\"{anchor_hash}\"")))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_ne!(
+        kept.lines().count(),
+        text.lines().filter(|l| !l.trim().is_empty()).count(),
+        "premise: a row must actually have been removed"
+    );
+    std::fs::write(&path, kept.as_bytes()).expect("write");
+    refix_manifest(dir.path(), "config_archive.jsonl", kept.as_bytes());
+
+    let r = verify::verify(&Bundle::load(dir.path()).expect("reload"));
+
+    assert!(
+        r.config_unresolved
+            .iter()
+            .any(|u| u.contains("anchored by the chain") && u.contains(&anchor_hash[..12])),
+        "the missing row must be named: {:?}",
+        r.config_unresolved
+    );
+    assert!(
+        r.config_problems.is_empty(),
+        "and it is not a content-addressing failure — nothing contradicts its address: {:?}",
+        r.config_problems
+    );
+    assert!(
+        r.structural_passed(),
+        "§9.2: an anchored hash with no row is informative, never a verdict — {:?}",
+        r.config_unresolved
     );
 }
 

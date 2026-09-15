@@ -107,6 +107,16 @@ pub struct EventRow {
     pub chain_version: i64,
     pub chain_hash: String,
     pub event_uid: String,
+    /// The `v1:`-prefixed HMAC tag of spec §8. Nullable: a leaf stamped
+    /// without a signing context carries none.
+    ///
+    /// Level 2 is out of scope for this verifier, so nothing here checks
+    /// it — but §9 lists it as a field of `events.jsonl`, and a reader
+    /// that does not even deserialize a listed field cannot report that
+    /// it went missing. Carrying it keeps that reportable, and lets a
+    /// caller distinguish a signed anchor from an unsigned one.
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 /// One row of `snapshots.jsonl` (spec §9): the six inputs of

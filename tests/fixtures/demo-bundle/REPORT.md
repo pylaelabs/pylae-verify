@@ -5,11 +5,11 @@
 - Sealed blocks: 2
 - Action leaves: 50
 - Forensic snapshots (the inputs of snapshot_hash, §2.2): 0
-- Event leaves: 1
+- Event leaves: 2
 - Erasure leaves: 13
 - Archived configuration artifacts: 4
 - Last sealed chain version: 50
-- Stamped-but-unsealed leaves (included, flagged): 14
+- Stamped-but-unsealed leaves (included, flagged): 15
 
 Erased actions appear as their tombstones; original payloads are not part of this bundle and cannot be reconstructed from it.
 If a daemon was running during the export, the bundle reflects the committed snapshot the reader observed and may lag the live head by in-flight writes.

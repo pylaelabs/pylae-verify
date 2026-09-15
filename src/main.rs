@@ -115,9 +115,15 @@ fn print_report(b: &Bundle, r: &Report) {
     );
     section("config anchors (content-addressed)", &r.config_problems);
 
+    if r.config_anchors > 0 {
+        println!(
+            "  [ok]   config anchors named by the chain: {} (spec §9.2)",
+            r.config_anchors
+        );
+    }
     if !r.config_unresolved.is_empty() {
         println!(
-            "  [note] {} config anchor(s) not resolvable in this version (report-only):",
+            "  [note] {} config anchor(s) not resolvable (report-only, spec §9.2):",
             r.config_unresolved.len()
         );
         for u in &r.config_unresolved {

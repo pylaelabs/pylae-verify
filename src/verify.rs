@@ -32,6 +32,11 @@ pub struct Report {
     pub tombstone_problems: Vec<String>,
     pub snapshot_count: usize,
     pub snapshot_problems: Vec<String>,
+    /// Distinct content hashes the chain says a complete archive would
+    /// hold (spec §9.2). Not the same as `config_resolved`, which counts
+    /// rows that re-derived: an archive can be fully self-consistent and
+    /// still be missing what the chain anchored.
+    pub config_anchors: usize,
     pub config_resolved: usize,
     pub config_unresolved: Vec<String>, // report-only limitations (e.g. manifest kind)
     pub config_problems: Vec<String>,   // genuine resolution failures (tamper)
@@ -378,7 +383,105 @@ pub fn verify(b: &Bundle) -> Report {
         }
     }
 
+    // ── Config anchors (spec §9.2 + §9.3) ──────────────────────────────────
+    //
+    // `config_archive.jsonl` is the archive, and an archive cannot say what
+    // is missing from it. The *anchors* — which hashes a complete archive
+    // would hold — are carried by a `compliance.config_active` leaf, and
+    // that leaf is part of the chain precisely so dropping an anchor is not
+    // a silent edit: alter the value and `details_canonical_hash` stops
+    // reproducing, remove the event and its slot has no leaf.
+    //
+    // A verifier that skips this checks only the rows it was handed, which
+    // is the producer's choice of what to hand over.
+    let archived: std::collections::HashSet<&str> =
+        b.configs.iter().map(|c| c.content_hash.as_str()).collect();
+    let (anchors, missing_anchor_leaf) = collect_config_anchors(&b.events);
+    if let Some(note) = missing_anchor_leaf {
+        r.config_unresolved.push(note);
+    }
+    r.config_anchors = anchors.len();
+    for (hash, label) in &anchors {
+        if !archived.contains(hash.as_str()) {
+            // Informative, never a verdict (spec §9.2): a database
+            // predating the archive has nothing to offer, and the absence
+            // says so. What it must not do is pass silently.
+            r.config_unresolved.push(format!(
+                "{label} {}: anchored by the chain, no row in config_archive.jsonl",
+                short(hash)
+            ));
+        }
+    }
+
     r
+}
+
+/// Event type carrying the active configuration's anchors (spec §9.3).
+const CONFIG_ANCHOR_EVENT: &str = "compliance.config_active";
+/// Event type carrying a demoted tool pin's rule-set fingerprints (§9.3).
+const PIN_DEMOTED_EVENT: &str = "pin.demoted_pending_revalidation";
+
+/// Collect the content hashes the chain anchors, by the rule of spec §9.2:
+/// the `compliance.config_active` leaf with the **highest `chain_version`**
+/// — the chain's own order, so two verifiers pick the same one — plus the
+/// rule-set fingerprints any demoted tool pin names.
+///
+/// Returns the anchors keyed by hash (so one hash anchored twice is one
+/// anchor) and, when the bundle carries no anchor leaf at all, the note
+/// that says so. That case is a real deployment state, not damage: a
+/// deployment with no usable identity emits no such event. It is reported
+/// rather than passed over, because "the archive is complete" and "nothing
+/// told me what complete means" are different answers.
+fn collect_config_anchors(events: &[EventRow]) -> (BTreeMap<String, &'static str>, Option<String>) {
+    let mut anchors: BTreeMap<String, &'static str> = BTreeMap::new();
+
+    match events
+        .iter()
+        .filter(|e| e.event_type == CONFIG_ANCHOR_EVENT)
+        .max_by_key(|e| e.chain_version)
+    {
+        Some(latest) => {
+            if let Some(h) = latest
+                .details
+                .pointer("/manifest/manifest_hash")
+                .and_then(serde_json::Value::as_str)
+            {
+                anchors.insert(h.to_string(), "active manifest");
+            }
+            if let Some(h) = latest
+                .details
+                .get("rules_fingerprint")
+                .and_then(serde_json::Value::as_str)
+            {
+                anchors.insert(h.to_string(), "active effective rules");
+            }
+        }
+        None => {
+            return (
+                anchors,
+                Some(
+                    "no compliance.config_active leaf: this bundle names no anchors, so the \
+                     config archive cannot be checked for completeness (spec §9.2)"
+                        .to_string(),
+                ),
+            );
+        }
+    }
+
+    // Pin fingerprints surface only for pins that were demoted, so they
+    // are not a pin list and §9.2 says they must not be read as one. They
+    // are still anchors when they appear.
+    for e in events.iter().filter(|e| e.event_type == PIN_DEMOTED_EVENT) {
+        for field in ["prev_rules_version", "current_rules_version"] {
+            if let Some(h) = e.details.get(field).and_then(serde_json::Value::as_str) {
+                anchors
+                    .entry(h.to_string())
+                    .or_insert("tool pin rules_version");
+            }
+        }
+    }
+
+    (anchors, None)
 }
 
 /// First 12 characters of a hash, for report lines.
@@ -639,6 +742,60 @@ mod tests {
         assert!(base64url_decode("Z").is_err());
         assert!(base64url_decode("Zm9vYg#").is_err());
         assert!(base64url_decode("Zm9v\u{e9}").is_err());
+    }
+
+    /// A bundle that names no anchors says so, instead of reading as an
+    /// archive with nothing missing.
+    ///
+    /// This is a real deployment state rather than damage — a deployment
+    /// with no usable identity emits no `compliance.config_active` leaf —
+    /// and it cannot be produced by editing a fixture: the leaf is part of
+    /// the chain, so removing it leaves a slot with no leaf and the
+    /// linkage check fires first. Hence a unit test on the collection
+    /// itself.
+    #[test]
+    fn a_bundle_with_no_anchor_leaf_reports_that_it_has_none() {
+        let (anchors, note) = collect_config_anchors(&[]);
+        assert!(anchors.is_empty());
+        let note = note.expect("the absence must be reported, not passed over");
+        assert!(note.contains("no compliance.config_active"), "{note}");
+    }
+
+    /// One hash anchored twice is one anchor, and the leaf with the
+    /// highest `chain_version` is the one that counts — the chain's own
+    /// order, so two verifiers reading the same bundle pick the same leaf.
+    #[test]
+    fn the_latest_anchor_leaf_wins_and_duplicates_collapse() {
+        let row = |cv: i64, manifest: &str, rules: &str| EventRow {
+            id: format!("id{cv}"),
+            event_type: CONFIG_ANCHOR_EVENT.to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            details: serde_json::json!({
+                "manifest": {"manifest_hash": manifest},
+                "rules_fingerprint": rules,
+            }),
+            chain_version: cv,
+            chain_hash: String::new(),
+            event_uid: String::new(),
+            signature: None,
+        };
+        // The OLDER leaf first, deliberately. With the newest first, "the
+        // first one in the file" and "the highest chain_version" are the
+        // same leaf and the test cannot tell the two rules apart — which
+        // is how this assertion looked satisfied while it was not.
+        let events = vec![row(4, "cc", "dd"), row(9, "aa", "bb")];
+        let (anchors, note) = collect_config_anchors(&events);
+        assert!(note.is_none());
+        assert_eq!(anchors.len(), 2);
+        assert!(anchors.contains_key("aa") && anchors.contains_key("bb"));
+        assert!(
+            !anchors.contains_key("cc"),
+            "the older leaf must not contribute"
+        );
+
+        // The same hash in both fields is one anchor.
+        let (one, _) = collect_config_anchors(&[row(1, "same", "same")]);
+        assert_eq!(one.len(), 1);
     }
 
     /// The §9.2 discriminator, both ways round. `{` is not in the
