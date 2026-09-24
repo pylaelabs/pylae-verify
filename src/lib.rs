@@ -8,3 +8,7 @@ pub mod bundle;
 pub mod canonical;
 pub mod chain;
 pub mod verify;
+
+/// The version of `docs/EVIDENCE-FORMAT.md` this build implements. A test
+/// reads the vendored document's header, so the two cannot drift silently.
+pub const SPEC_VERSION: &str = "0.1";

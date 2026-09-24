@@ -13,6 +13,7 @@ use std::process::ExitCode;
 
 use pylae_verify::bundle::Bundle;
 use pylae_verify::verify::{self, Report};
+use pylae_verify::SPEC_VERSION;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -22,7 +23,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         Some("--version") => {
-            println!("pylae-verify {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "pylae-verify {} (evidence format spec {SPEC_VERSION})",
+                env!("CARGO_PKG_VERSION")
+            );
             return ExitCode::SUCCESS;
         }
         Some(p) => p,
@@ -68,7 +72,7 @@ fn section(title: &str, problems: &[String]) {
 
 fn print_report(b: &Bundle, r: &Report) {
     println!(
-        "pylae-verify {} — structural verification",
+        "pylae-verify {} — structural verification (evidence format spec {SPEC_VERSION})",
         env!("CARGO_PKG_VERSION")
     );
     println!("bundle: {}", b.dir.display());

@@ -1,0 +1,78 @@
+# Builds release binaries from a `v*` tag and signs each archive with cosign
+# keyless signing. The signing identity is this workflow file at the tag's
+# ref, attested by GitHub's OIDC issuer and recorded in the public Rekor log;
+# there is no long-lived signing key to hold or leak. README "Verify a
+# release binary" shows the matching `cosign verify-blob` invocation.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-musl }
+          - { os: macos-latest,   target: aarch64-apple-darwin }
+          - { os: macos-latest,   target: x86_64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # The tests run against the vendored spec and both fixtures before
+      # anything is built for release; a tag whose tests fail ships nothing.
+      - if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test --locked
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name="pylae-verify-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          bin=pylae-verify; [[ "${{ matrix.target }}" == *windows* ]] && bin=pylae-verify.exe
+          cp "target/${{ matrix.target }}/release/$bin" LICENSE README.md "$name/"
+          cp docs/EVIDENCE-FORMAT.md "$name/"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a "$name.zip" "$name" >/dev/null
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: pylae-verify-*.*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the GitHub release
+      id-token: write   # OIDC token for cosign keyless signing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: sigstore/cosign-installer@v3
+      - name: Checksum and sign
+        working-directory: dist
+        run: |
+          sha256sum pylae-verify-* > SHA256SUMS
+          for f in pylae-verify-* SHA256SUMS; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+          done
+      - name: Create release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" --notes "Signed with cosign keyless signing. See README, 'Verify a release binary'." ./*
