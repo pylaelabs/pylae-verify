@@ -19,7 +19,7 @@ cargo build --release
 ```
 pylae-verify 0.1.0 — structural verification (evidence format spec 0.1)
 bundle: tests/fixtures/demo-bundle
-exported by Pylae 0.2.0
+exported by Pylae 0.2.1
 leaves: 65 (actions 50, erasures 13, events 2) · blocks: 2 · snapshots: 0 · config artifacts: 4
 
 Level 1 — structural (keyless):
@@ -39,12 +39,11 @@ Level 2 — attribution (authorship / anti-operator tamper):
 RESULT: OK — structural integrity verified (65 leaves, 2 blocks).
 ```
 
-Now change one byte. The first action read `file:///data/report_8.csv`, and this edit
-makes it `report_9.csv`:
+Now change one byte. The first action ran in 2026, and this edit backdates it to 2025:
 
 ```bash
 cp -r tests/fixtures/demo-bundle tampered
-sed -i '0,/report_8\.csv/s//report_9.csv/' tampered/actions.jsonl   # macOS: use gsed
+sed -i '0,/"timestamp":"2026-/s//"timestamp":"2025-/' tampered/actions.jsonl   # macOS: use gsed
 ./target/release/pylae-verify tampered; echo "exit=$?"
 ```
 
@@ -69,14 +68,14 @@ Two checks fail, and each does so on its own:
   longer matches the stored `chain_hash`.
 
 Someone who edits a row usually rewrites `MANIFEST.json` too. When they do, the leaf check
-still fails here, because this edit is in `request_params`, which the action leaf commits
-through its params hash (spec §5.1). The test
+still fails here, because `timestamp` is a field the action leaf commits (spec §5.1). The
+test
 `tampering_an_action_is_caught_by_leaf_recomputation` in
 [`tests/integration.rs`](./tests/integration.rs) does exactly that. The Merkle blocks stay
 `[ok]` because blocks fold the stored leaf hashes (spec §7), and this edit changed the row,
 not its stored hash.
 
-The same edit to a column no leaf commits passes. An action row carries the fields its leaf
+An edit to a column no leaf commits passes instead. An action row carries the fields its leaf
 folds (spec §5.1) and operational columns beside them, which spec §9 tells a verifier to
 ignore. Change `resource_uri`, `session_id`, `model_id`, `evaluation_trace` or `latency_us`,
 rewrite the manifest, and the bundle verifies clean. The test

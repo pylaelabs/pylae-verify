@@ -98,17 +98,14 @@ fn the_readme_try_it_output_is_what_the_binary_prints() {
 
 #[test]
 fn the_readme_tamper_output_is_what_the_binary_prints() {
-    // The README's edit: the first `report_8.csv` in actions.jsonl becomes
-    // `report_9.csv`, and the manifest is left as it was.
+    // The README's edit: the first `"timestamp":"2026-` in actions.jsonl, the
+    // first action's, becomes 2025, and the manifest is left as it was.
+    let (from, to) = (r#""timestamp":"2026-"#, r#""timestamp":"2025-"#);
     let dir = Copy::of(DEMO, "cli-readme-tamper");
     let actions = dir.0.join("actions.jsonl");
     let text = std::fs::read_to_string(&actions).expect("read actions.jsonl");
-    assert!(
-        text.contains("report_8.csv"),
-        "the README's edit needs report_8.csv"
-    );
-    std::fs::write(&actions, text.replacen("report_8.csv", "report_9.csv", 1))
-        .expect("write actions.jsonl");
+    assert!(text.contains(from), "the README's edit needs {from}");
+    std::fs::write(&actions, text.replacen(from, to, 1)).expect("write actions.jsonl");
     let shown = readme_output_after("./target/release/pylae-verify tampered; echo \"exit=$?\"");
 
     let (code, report) = run(&dir.0);
