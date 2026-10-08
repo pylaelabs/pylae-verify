@@ -31,7 +31,7 @@ Level 1 — structural (keyless):
   [ok]   tombstone consistency (GDPR erasure)
   [ok]   forensic snapshots (inputs recompute their hash)
   [ok]   config anchors (content-addressed)
-  [ok]   config anchors named by the chain: 2 (spec §9.2)
+  [ok]   config anchors named by the chain: 2, 0 without a row (spec §9.2)
 
 Level 2 — attribution (authorship / anti-operator tamper):
   [skip] requires the per-deployment seed; not verifiable by a third party (spec §8, §10)
@@ -69,10 +69,20 @@ Two checks fail, and each does so on its own:
   longer matches the stored `chain_hash`.
 
 Someone who edits a row usually rewrites `MANIFEST.json` too. When they do, the leaf check
-still fails. The test `tampering_an_action_is_caught_by_leaf_recomputation` in
+still fails here, because this edit is in `request_params`, which the action leaf commits
+through its params hash (spec §5.1). The test
+`tampering_an_action_is_caught_by_leaf_recomputation` in
 [`tests/integration.rs`](./tests/integration.rs) does exactly that. The Merkle blocks stay
 `[ok]` because blocks fold the stored leaf hashes (spec §7), and this edit changed the row,
 not its stored hash.
+
+The same edit to a column no leaf commits passes. An action row carries the fields its leaf
+folds (spec §5.1) and operational columns beside them, which spec §9 tells a verifier to
+ignore. Change `resource_uri`, `session_id`, `model_id`, `evaluation_trace` or `latency_us`,
+rewrite the manifest, and the bundle verifies clean. The test
+`an_operational_column_edited_under_a_rewritten_manifest_verifies_clean` does that, and
+`a_committed_field_edited_under_a_rewritten_manifest_fails` checks the opposite for every
+field §5.1 folds.
 
 ## What each check establishes, and what it does not
 
@@ -81,14 +91,14 @@ can run it (spec §10).
 
 | Check | Establishes | Does not establish |
 |---|---|---|
-| **Bundle manifest** (§9.1) | every file matches the SHA-256 and size in `MANIFEST.json` | anything, if the editor also rewrote the manifest. The manifest is not signed. |
+| **Bundle manifest** (§9.1) | every file matches the SHA-256 and size in `MANIFEST.json`, every file the export always writes is listed, and a `snapshots.jsonl` on disk is listed | anything, if the editor also rewrote the manifest. The manifest is not signed. |
 | **Genesis** (§4) | the chain starts at the genesis hash of the deployment fingerprint in `identity.json` | that `identity.json` names the deployment you think it does |
 | **Chain linkage** (§5) | each leaf's predecessor is the leaf before it, back to genesis, with no missing slot | that the whole chain was not rebuilt from scratch. Every hash here is keyless, so anyone who can rewrite the rows can recompute all of them. |
-| **Leaf recomputation** (§5) | every action, erasure, event and response leaf re-hashes from its row | the truth of what a row records. A leaf commits to the row as written. |
-| **Merkle blocks** (§7) | each sealed block's root recomputes from its leaves and is bound to `actions_count`; blocks link to each other | that the blocks match any copy you received earlier. This tool does not compare against one. |
+| **Leaf recomputation** (§5) | every action, erasure, event and response leaf re-hashes from its row; a leaf with no predecessor to recompute against is named as not recomputed, never counted as passing | the truth of what a row records, or anything its leaf does not fold. A leaf commits the fields spec §5 lists, not the row as written: an action row's operational columns, such as `session_id` or `model_id`, verify clean after an edit under a rewritten manifest. |
+| **Merkle blocks** (§7) | each sealed block's root recomputes from its leaves and is bound to `actions_count`; blocks link to each other; a slot in a block's range that holds no leaf is reported, even when the root recomputes (§10) | that the blocks match any copy you received earlier. This tool does not compare against one. |
 | **Tombstones** (§6) | each GDPR erasure's `tombstone_hash` recomputes and matches the `redacted_marker_hash` on the action it erased; an erased action without that marker is reported | the erased content. It is gone by design, and only its hash commitment remains. The check runs from each erasure to its action, not the other way round. |
 | **Forensic snapshots** (§2.2, §9) | each `snapshot_hash` recomputes from the six inputs the bundle ships | that the inputs were right when they were captured. The action leaf commits to the snapshot's *hash*, so an edited input is invisible to the leaf check. The test `editing_a_snapshot_input_is_caught_only_by_the_snapshot_recompute` shows that this check catches it. |
-| **Config anchors** (§9.2) | every archived config (effective rules, CVE feed, rule manifest as payload or JWS) re-hashes to its own address, and the anchors come from a signed `compliance.config_active` leaf in the chain, so a dropped archive row is reported | completeness. An anchored hash with no row is reported as a note, not a failure (spec §9.2). Tool pins are not exported, so their anchors cannot be checked at all. |
+| **Config anchors** (§9.2) | every archived config (effective rules, CVE feed, rule manifest as payload or JWS) re-hashes to its own address, and the anchors come from a `compliance.config_active` leaf in the chain (its signature is Level 2 material and is not checked here), so a dropped archive row is reported | completeness. An anchored hash with no row is reported as a note, not a failure (spec §9.2). Tool pins are not exported, so their anchors cannot be checked at all. |
 
 ## What it does not do
 
@@ -165,7 +175,7 @@ The spec is meant for anyone who wants to write another verifier. This one depen
 
 ## Test fixtures
 
-Both bundles under `tests/fixtures/` are real exports, regenerated from the producer's tree:
+Both bundles under `tests/fixtures/` are written by the producer's own export path, from deployments its test generators build, and are regenerated from the producer's tree:
 
 ```bash
 # in the Pylae core repo
@@ -179,6 +189,10 @@ payload, a captured response leaf, a forensic snapshot with its inputs, and all 
 content-addressed referents. Each generator asserts the shapes it exists to provide, so a
 fixture that stops carrying one fails when it is generated instead of silently making a
 test vacuous.
+
+Neither fixture can exercise Level 2. Both generators pin the deployment fingerprint to 32 zero
+bytes, and no seed derivable from either bundle reproduces its event signatures. The genesis
+check passes on them, but it binds each chain to that zero fingerprint and not to a deployment.
 
 ## License
 

@@ -57,6 +57,13 @@ pub fn normalize_timestamp(ts: &str) -> String {
 pub fn genesis_hash(fingerprint_hex: &str) -> Result<String, String> {
     let raw =
         hex::decode(fingerprint_hex).map_err(|e| format!("invalid seed fingerprint hex: {e}"))?;
+    // Spec §8: the fingerprint is SHA-256 of the seed, 32 bytes.
+    if raw.len() != 32 {
+        return Err(format!(
+            "seed fingerprint is {} bytes; spec §8 fixes it at 32",
+            raw.len()
+        ));
+    }
     let mut buf = Vec::with_capacity(DS_GENESIS.len() + raw.len());
     buf.extend_from_slice(DS_GENESIS);
     buf.extend_from_slice(&raw);
@@ -333,9 +340,14 @@ mod tests {
     }
 
     #[test]
-    fn genesis_rejects_bad_hex() {
+    fn genesis_accepts_only_a_32_byte_hex_fingerprint() {
         assert!(genesis_hash("nothex").is_err());
-        assert!(genesis_hash("338eae5e").is_ok());
+        assert!(
+            genesis_hash("338eae5e").is_err(),
+            "4 bytes is not a fingerprint"
+        );
+        assert!(genesis_hash(&"00".repeat(33)).is_err());
+        assert!(genesis_hash(&"00".repeat(32)).is_ok());
     }
 
     #[test]

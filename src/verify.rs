@@ -25,6 +25,11 @@ pub struct Report {
     pub manifest_problems: Vec<String>,
     pub leaf_count: usize,
     pub leaf_mismatches: Vec<String>,
+    /// Leaves the walk could not recompute because no predecessor hash was
+    /// available. Kept apart from `leaf_mismatches`: nothing was found wrong
+    /// with them, but nothing was checked either, and the leaf-recomputation
+    /// line must not claim otherwise.
+    pub leaves_not_recomputed: Vec<String>,
     pub linkage_gaps: Vec<String>,
     pub block_count: usize,
     pub block_problems: Vec<String>,
@@ -37,6 +42,8 @@ pub struct Report {
     /// rows that re-derived: an archive can be fully self-consistent and
     /// still be missing what the chain anchored.
     pub config_anchors: usize,
+    /// Of `config_anchors`, how many have no row in the archive.
+    pub config_anchors_without_row: usize,
     pub config_resolved: usize,
     pub config_unresolved: Vec<String>, // report-only limitations (e.g. manifest kind)
     pub config_problems: Vec<String>,   // genuine resolution failures (tamper)
@@ -56,6 +63,7 @@ impl Report {
         self.genesis_error.is_none()
             && self.manifest_problems.is_empty()
             && self.leaf_mismatches.is_empty()
+            && self.leaves_not_recomputed.is_empty()
             && self.linkage_gaps.is_empty()
             && self.block_problems.is_empty()
             && self.tombstone_problems.is_empty()
@@ -116,7 +124,16 @@ pub fn verify(b: &Bundle) -> Report {
     // ── Index leaves by chain_version; detect collisions ───────────────────
     let mut index: BTreeMap<i64, Leaf> = BTreeMap::new();
 
+    let mut seen_action_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for a in &b.actions {
+        // Every lookup below keys actions by `id` (tombstones, snapshots);
+        // two rows under one id would let those lookups answer for either.
+        if !seen_action_ids.insert(a.id.as_str()) {
+            r.leaf_mismatches.push(format!(
+                "action {}: two rows in actions.jsonl share this id",
+                a.id
+            ));
+        }
         if index.insert(a.chain_version, Leaf::Action(a)).is_some() {
             r.leaf_mismatches
                 .push(format!("chain_version {}: duplicate leaf", a.chain_version));
@@ -170,7 +187,15 @@ pub fn verify(b: &Bundle) -> Report {
         let prev: &str = if cv == 1 {
             match genesis.as_deref() {
                 Some(g) => g,
-                None => continue, // genesis error already recorded
+                None => {
+                    // The genesis error is recorded on its own line; this
+                    // records that the first leaf was therefore not checked.
+                    r.leaves_not_recomputed.push(format!(
+                        "chain_version 1 ({}): no genesis hash",
+                        leaf.kind()
+                    ));
+                    continue;
+                }
             }
         } else {
             match stored_by_cv.get(&(cv - 1)) {
@@ -178,6 +203,11 @@ pub fn verify(b: &Bundle) -> Report {
                 None => {
                     r.linkage_gaps
                         .push(format!("chain_version {cv}: no predecessor at {}", cv - 1));
+                    r.leaves_not_recomputed.push(format!(
+                        "chain_version {cv} ({}): no predecessor at {}",
+                        leaf.kind(),
+                        cv - 1
+                    ));
                     continue;
                 }
             }
@@ -295,6 +325,20 @@ pub fn verify(b: &Bundle) -> Report {
         }
     }
 
+    // Spec §9: a snapshot row appears if and only if its action carried a
+    // snapshot. The loop above walks actions, so a row naming no action at
+    // all is only visible from this side.
+    let action_ids: std::collections::HashSet<&str> =
+        b.actions.iter().map(|a| a.id.as_str()).collect();
+    for s in &b.snapshots {
+        if !action_ids.contains(s.action_id.as_str()) {
+            r.snapshot_problems.push(format!(
+                "snapshots.jsonl: row for action {} which no row of actions.jsonl holds",
+                s.action_id
+            ));
+        }
+    }
+
     // ── Merkle blocks (spec §7) ────────────────────────────────────────────
     r.block_count = b.blocks.len();
     let mut blocks: Vec<&_> = b.blocks.iter().collect();
@@ -304,6 +348,21 @@ pub fn verify(b: &Bundle) -> Report {
         let leaves: Vec<&str> = (bl.first_chain_version..=bl.last_chain_version)
             .filter_map(|cv| stored_by_cv.get(&cv).copied())
             .collect();
+        // Spec §10, Sealing: a slot in the block's range that no leaf holds
+        // makes the block not intact, whether or not the root recomputes.
+        // Where the lost leaf was sealed the root below also mismatches;
+        // where the slot was empty at sealing time the root recomputes, and
+        // this line is the only thing that reports the block.
+        let empty: Vec<i64> = (bl.first_chain_version..=bl.last_chain_version)
+            .filter(|cv| !index.contains_key(cv))
+            .collect();
+        if !empty.is_empty() {
+            r.block_problems.push(format!(
+                "block {}: slot(s) {} in its range hold no leaf",
+                bl.block_number,
+                ranges(&empty)
+            ));
+        }
         match block_root(&leaves, bl.actions_count) {
             Some(root) if root == bl.merkle_root => {}
             Some(_) => r.block_problems.push(format!(
@@ -403,6 +462,7 @@ pub fn verify(b: &Bundle) -> Report {
     r.config_anchors = anchors.len();
     for (hash, label) in &anchors {
         if !archived.contains(hash.as_str()) {
+            r.config_anchors_without_row += 1;
             // Informative, never a verdict (spec §9.2): a database
             // predating the archive has nothing to offer, and the absence
             // says so. What it must not do is pass silently.
@@ -688,9 +748,39 @@ fn resolve_params_hash(
     canonical_params_hash(a.request_params.as_ref())
 }
 
+/// `[3,4,5,9]` → `"3–5, 9"`. Input is ascending.
+fn ranges(slots: &[i64]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < slots.len() {
+        let start = slots[i];
+        let mut end = start;
+        while i + 1 < slots.len() && slots[i + 1] == end + 1 {
+            i += 1;
+            end = slots[i];
+        }
+        out.push(if start == end {
+            start.to_string()
+        } else {
+            format!("{start}–{end}")
+        });
+        i += 1;
+    }
+    out.join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fixtures only ever leave single empty slots, so the run-joining
+    /// branch is exercised here or nowhere.
+    #[test]
+    fn empty_slots_print_as_runs() {
+        assert_eq!(ranges(&[30]), "30");
+        assert_eq!(ranges(&[3, 4, 5, 9]), "3–5, 9");
+        assert_eq!(ranges(&[1, 2, 4, 5]), "1–2, 4–5");
+    }
 
     /// RFC 4648 §10 vectors, which cover the three final-group shapes the
     /// decoder has to get right. A JWS payload segment lands on whichever

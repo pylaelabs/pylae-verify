@@ -613,6 +613,409 @@ fn two_snapshot_rows_for_one_action_are_reported() {
     assert!(!r.structural_passed());
 }
 
+// ── Every [ok] the report prints is true ────────────────────────────────────
+
+#[test]
+fn a_leaf_after_a_gap_is_reported_as_not_recomputed() {
+    // Remove event 64 and edit event 65's details without touching its
+    // stored hash. The walk has no predecessor for 65, so it cannot
+    // recompute it, and the edit is invisible to every other check (the
+    // event sits above the last sealed block). The report must say 65 was
+    // not checked rather than count it under "all leaves re-hash".
+    let dir = TempBundle::from_dir(DEMO, "gap-leaf");
+    let events = dir.path().join("events.jsonl");
+    let original = std::fs::read_to_string(&events).expect("read events.jsonl");
+    let mut kept = String::new();
+    for line in original.lines().filter(|l| !l.trim().is_empty()) {
+        let mut v: serde_json::Value = serde_json::from_str(line).expect("row");
+        match v["chain_version"].as_i64() {
+            Some(64) => continue,
+            Some(65) => v["details"]["edited_after_export"] = serde_json::Value::Bool(true),
+            _ => {}
+        }
+        kept.push_str(&v.to_string());
+        kept.push('\n');
+    }
+    std::fs::write(&events, &kept).expect("write events.jsonl");
+    refix_manifest(dir.path(), "events.jsonl", kept.as_bytes());
+
+    let r = verify::verify(&Bundle::load(dir.path()).expect("load"));
+
+    assert!(!r.structural_passed());
+    assert!(
+        r.leaves_not_recomputed
+            .iter()
+            .any(|l| l.starts_with("chain_version 65 ")),
+        "leaf 65 has no predecessor and must be named as not recomputed: {:?}",
+        r.leaves_not_recomputed
+    );
+    assert!(
+        r.leaf_mismatches.is_empty(),
+        "nothing was recomputed and found wrong: {:?}",
+        r.leaf_mismatches
+    );
+}
+
+#[test]
+fn a_required_file_absent_from_the_manifest_is_reported() {
+    // Delete events.jsonl and its manifest entry. Every remaining entry
+    // still matches, a missing file reads as an empty one, and the tail
+    // events sit above the last sealed block, so nothing else notices.
+    let dir = TempBundle::from_dir(DEMO, "manifest-complete");
+    std::fs::remove_file(dir.path().join("events.jsonl")).expect("remove events.jsonl");
+    let path = dir.path().join("MANIFEST.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+    manifest["files"]
+        .as_array_mut()
+        .expect("files")
+        .retain(|e| e["name"] != "events.jsonl");
+    std::fs::write(&path, manifest.to_string()).expect("write MANIFEST.json");
+
+    let r = verify::verify(&Bundle::load(dir.path()).expect("load"));
+
+    assert!(!r.structural_passed());
+    assert!(
+        r.manifest_problems
+            .iter()
+            .any(|p| p.starts_with("events.jsonl: required")),
+        "{:?}",
+        r.manifest_problems
+    );
+}
+
+#[test]
+fn a_snapshot_row_naming_no_action_is_reported() {
+    let dir = TempBundle::from_dir(CONFORMANCE, "orphan-snapshot");
+    let snaps = dir.path().join("snapshots.jsonl");
+    let original = std::fs::read_to_string(&snaps).expect("read snapshots.jsonl");
+    let mut orphan: serde_json::Value =
+        serde_json::from_str(original.lines().next().expect("one row")).expect("row");
+    orphan["action_id"] = serde_json::Value::String("00000000-0000-0000-0000-00000000dead".into());
+    let tampered = format!("{original}{orphan}\n");
+    std::fs::write(&snaps, &tampered).expect("write");
+    refix_manifest(dir.path(), "snapshots.jsonl", tampered.as_bytes());
+
+    let r = verify::verify(&Bundle::load(dir.path()).expect("load"));
+
+    assert!(!r.structural_passed());
+    assert!(
+        r.snapshot_problems
+            .iter()
+            .any(|p| p.contains("00000000-0000-0000-0000-00000000dead")),
+        "{:?}",
+        r.snapshot_problems
+    );
+}
+
+#[test]
+fn two_action_rows_sharing_an_id_are_reported() {
+    let dir = TempBundle::from_dir(DEMO, "dup-id");
+    let actions = dir.path().join("actions.jsonl");
+    let original = std::fs::read(&actions).expect("read");
+    let mut first_id: Option<String> = None;
+    let tampered = rewrite_rows(&original, |v| {
+        let id = v["id"].as_str().expect("id").to_string();
+        match &first_id {
+            None => first_id = Some(id),
+            Some(f) if v["chain_version"] == 2 => v["id"] = serde_json::Value::String(f.clone()),
+            _ => {}
+        }
+    });
+    std::fs::write(&actions, &tampered).expect("write");
+    refix_manifest(dir.path(), "actions.jsonl", &tampered);
+
+    let r = verify::verify(&Bundle::load(dir.path()).expect("load"));
+
+    let id = first_id.expect("fixture has actions");
+    assert!(!r.structural_passed());
+    assert!(
+        r.leaf_mismatches
+            .iter()
+            .any(|m| m == &format!("action {id}: two rows in actions.jsonl share this id")),
+        "{:?}",
+        r.leaf_mismatches
+    );
+}
+
+// ── Spec §10, Sealing: a block with an unfilled slot is not intact ─────────
+
+#[test]
+fn an_empty_slot_inside_a_block_is_reported_even_when_its_root_recomputes() {
+    // Remove action 30 and re-seal block 2 over the leaves that remain, as a
+    // producer would have if slot 30 was already empty at sealing time. The
+    // root then recomputes; only the empty slot says the block is not intact.
+    let dir = TempBundle::from_dir(DEMO, "empty-slot");
+    let actions = dir.path().join("actions.jsonl");
+    let original = std::fs::read_to_string(&actions).expect("read");
+    let kept: String = original
+        .lines()
+        .filter(|l| !l.contains("\"chain_version\":30,"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_ne!(kept.len(), original.len(), "fixture must hold slot 30");
+    std::fs::write(&actions, &kept).expect("write");
+    refix_manifest(dir.path(), "actions.jsonl", kept.as_bytes());
+    reseal_block(dir.path(), 2, None);
+
+    let r = verify::verify(&Bundle::load(dir.path()).expect("load"));
+
+    assert!(
+        !r.block_problems.iter().any(|p| p.contains("root mismatch")),
+        "the re-sealed root must recompute, or this test proves nothing: {:?}",
+        r.block_problems
+    );
+    assert!(
+        r.block_problems
+            .iter()
+            .any(|p| p == "block 2: slot(s) 30 in its range hold no leaf"),
+        "{:?}",
+        r.block_problems
+    );
+}
+
+#[test]
+fn an_empty_slot_at_the_tail_of_the_last_block_is_reported() {
+    // Extend the conformance bundle's only block to slot 6, one past the
+    // last leaf, and re-seal it. No leaf sits above slot 6, so there is no
+    // linkage gap: without the slot check this bundle verifies clean.
+    let dir = TempBundle::from_dir(CONFORMANCE, "tail-slot");
+    reseal_block(dir.path(), 1, Some(6));
+
+    let r = verify::verify(&Bundle::load(dir.path()).expect("load"));
+
+    assert!(
+        r.linkage_gaps.is_empty(),
+        "no leaf above slot 6, so no linkage gap: {:?}",
+        r.linkage_gaps
+    );
+    assert!(!r.block_problems.iter().any(|p| p.contains("root mismatch")));
+    assert!(!r.structural_passed());
+    assert!(
+        r.block_problems
+            .iter()
+            .any(|p| p == "block 1: slot(s) 6 in its range hold no leaf"),
+        "{:?}",
+        r.block_problems
+    );
+}
+
+#[test]
+fn a_snapshots_file_on_disk_that_the_manifest_does_not_list_is_reported() {
+    // `snapshots.jsonl` may be absent from an older export, but when it is
+    // on disk it is consumed, so the manifest must cover it.
+    let dir = TempBundle::from_dir(CONFORMANCE, "manifest-optional");
+    let path = dir.path().join("MANIFEST.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+    manifest["files"]
+        .as_array_mut()
+        .expect("files")
+        .retain(|e| e["name"] != "snapshots.jsonl");
+    std::fs::write(&path, manifest.to_string()).expect("write MANIFEST.json");
+
+    let r = verify::verify(&Bundle::load(dir.path()).expect("load"));
+
+    assert!(!r.structural_passed());
+    assert!(
+        r.manifest_problems
+            .iter()
+            .any(|p| p == "snapshots.jsonl: present but not listed in MANIFEST.json"),
+        "{:?}",
+        r.manifest_problems
+    );
+}
+
+#[test]
+fn without_a_genesis_hash_the_first_leaf_is_named_as_not_recomputed() {
+    // A 4-byte fingerprint derives no genesis hash (spec §8 fixes it at 32
+    // bytes), so the first leaf has nothing to be recomputed against.
+    let dir = TempBundle::from_dir(DEMO, "no-genesis");
+    let path = dir.path().join("identity.json");
+    let mut identity: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+    identity["stored_seed_fingerprint"] = "338eae5e".into();
+    let edited = identity.to_string();
+    std::fs::write(&path, &edited).expect("write identity.json");
+    refix_manifest(dir.path(), "identity.json", edited.as_bytes());
+
+    let r = verify::verify(&Bundle::load(dir.path()).expect("load"));
+
+    assert!(r.genesis_error.is_some());
+    assert!(
+        r.leaves_not_recomputed
+            .iter()
+            .any(|l| l.starts_with("chain_version 1 ") && l.ends_with("no genesis hash")),
+        "{:?}",
+        r.leaves_not_recomputed
+    );
+}
+
+// ── What a leaf commits, and what it does not ──────────────────────────────
+
+/// An edit to one column of an action row.
+type Edit = fn(&mut serde_json::Value);
+
+/// Which action row an edit lands on.
+type Row = fn(&serde_json::Value) -> bool;
+
+/// Neither truncated nor erased: every field §5.1 folds is committed as
+/// stored (spec §9, rule 3).
+fn ordinary(v: &serde_json::Value) -> bool {
+    v["request_params_truncated"] != true && v["redacted_marker_hash"].is_null()
+}
+
+/// An ordinary row that also carries the raw commitment, which rule 3 must
+/// not serve in place of the stored payload.
+fn ordinary_with_raw_hash(v: &serde_json::Value) -> bool {
+    ordinary(v) && !v["request_params_raw_hash"].is_null()
+}
+
+#[test]
+fn a_committed_field_edited_under_a_rewritten_manifest_fails() {
+    // Every action-row field the leaf folds (spec §5.1), and the stored leaf
+    // hash. `request_params` enters through its params hash. Each edit is
+    // made alone, under a manifest re-fixed to match, and the leaf walk must
+    // name the edited row.
+    let cases: [(&str, &str, Row, Edit); 15] = [
+        (DEMO, "agent_id", ordinary, flip_last_char),
+        (DEMO, "method", ordinary, append_edited),
+        (DEMO, "tool_name", ordinary, append_edited),
+        (DEMO, "request_params", ordinary, |v| {
+            v["edited_after_export"] = true.into()
+        }),
+        (CONFORMANCE, "request_params", ordinary_with_raw_hash, |v| {
+            v["edited_after_export"] = true.into()
+        }),
+        (DEMO, "decision", ordinary, |v| {
+            *v = if v == "allow" { "block" } else { "allow" }.into()
+        }),
+        (DEMO, "decision_source", ordinary, append_edited),
+        (DEMO, "policy_id", ordinary, flip_last_char),
+        (DEMO, "server_id", ordinary, flip_last_char),
+        (DEMO, "timestamp", ordinary, |v| {
+            *v = v
+                .as_str()
+                .expect("timestamp")
+                .replacen("2026", "2025", 1)
+                .into()
+        }),
+        (CONFORMANCE, "snapshot_hash", ordinary, flip_last_char),
+        (CONFORMANCE, "request_params_truncated", ordinary, |v| {
+            *v = (!v.as_bool().expect("bool")).into()
+        }),
+        (CONFORMANCE, "request_params_original_size", ordinary, |v| {
+            *v = (v.as_i64().expect("size") + 1).into()
+        }),
+        (DEMO, "chain_hash", ordinary, flip_last_char),
+        (DEMO, "chain_version", ordinary, |v| {
+            *v = (v.as_i64().expect("slot") + 1000).into()
+        }),
+    ];
+    let mut missed = Vec::new();
+    for (n, (src, column, row, edit)) in cases.into_iter().enumerate() {
+        let (r, cv) = edit_first_action(src, &format!("committed-{n}"), column, row, edit);
+        let named = if column == "chain_version" {
+            // The slot itself moved: the walk finds a hole where it was.
+            r.linkage_gaps
+                .iter()
+                .any(|g| g == &format!("chain_version {}: no predecessor at {cv}", cv + 1))
+        } else {
+            r.leaf_mismatches
+                .iter()
+                .any(|m| m.starts_with(&format!("chain_version {cv} ")))
+        };
+        if !named || r.structural_passed() {
+            missed.push(format!(
+                "{column} (chain_version {cv}): leaves={:?} gaps={:?}",
+                r.leaf_mismatches, r.linkage_gaps
+            ));
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "edits the leaf walk did not name: {missed:#?}"
+    );
+}
+
+#[test]
+fn an_operational_column_edited_under_a_rewritten_manifest_verifies_clean() {
+    // The README names these as columns no leaf commits. Each edit, made
+    // alone under a re-fixed manifest, verifies clean, and the README keeps
+    // naming every one of them.
+    let readme = std::fs::read_to_string("README.md").expect("read README.md");
+    let cases: [(&str, &str, Edit); 5] = [
+        (DEMO, "resource_uri", append_edited),
+        (DEMO, "session_id", flip_last_char),
+        (DEMO, "model_id", append_edited),
+        (DEMO, "evaluation_trace", |v| {
+            v["edited_after_export"] = true.into()
+        }),
+        (CONFORMANCE, "latency_us", |v| {
+            *v = (v.as_i64().expect("latency") + 1).into()
+        }),
+    ];
+    for (src, column, edit) in cases {
+        assert!(
+            readme.contains(&format!("`{column}`")),
+            "README.md no longer names `{column}`"
+        );
+        let tag = format!("operational-{column}");
+        let (r, cv) = edit_first_action(src, &tag, column, ordinary, edit);
+        assert!(
+            r.structural_passed(),
+            "{column} (chain_version {cv}) is committed after all: leaves={:?} gaps={:?} \
+             manifest={:?}",
+            r.leaf_mismatches,
+            r.linkage_gaps,
+            r.manifest_problems
+        );
+    }
+}
+
+/// Copy `src`, apply `edit` to `column` of the first action row that `row`
+/// accepts and where `column` is not null, re-fix the manifest, and verify.
+/// Returns the report and the edited row's `chain_version` as it was before
+/// the edit.
+fn edit_first_action(
+    src: &str,
+    tag: &str,
+    column: &str,
+    row: Row,
+    edit: Edit,
+) -> (verify::Report, i64) {
+    let dir = TempBundle::from_dir(src, tag);
+    let path = dir.path().join("actions.jsonl");
+    let original = std::fs::read(&path).expect("read actions.jsonl");
+    let mut edited: Option<i64> = None;
+    let tampered = rewrite_rows(&original, |v| {
+        if edited.is_none() && row(v) && !v[column].is_null() {
+            edited = v["chain_version"].as_i64();
+            edit(&mut v[column]);
+        }
+    });
+    let cv = edited.unwrap_or_else(|| panic!("no action row in {src} carries `{column}`"));
+    std::fs::write(&path, &tampered).expect("write actions.jsonl");
+    refix_manifest(dir.path(), "actions.jsonl", &tampered);
+    let r = verify::verify(&Bundle::load(dir.path()).expect("load"));
+    (r, cv)
+}
+
+fn append_edited(v: &mut serde_json::Value) {
+    *v = format!("{}-edited", v.as_str().expect("string column")).into();
+}
+
+/// Changes the last character of a hex or UUID string, keeping its shape.
+fn flip_last_char(v: &mut serde_json::Value) {
+    let s = v.as_str().expect("string column");
+    let flipped = match s.chars().last() {
+        Some('0') => '1',
+        Some(_) => '0',
+        None => '0',
+    };
+    *v = format!("{}{flipped}", &s[..s.len().saturating_sub(1)]).into();
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 fn replace_once(haystack: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
@@ -728,4 +1131,59 @@ impl Drop for TempBundle {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// Stored leaf hash by chain slot, from every row kind that carries one.
+fn stored_hashes(dir: &Path) -> std::collections::BTreeMap<i64, String> {
+    let b = Bundle::load(dir).expect("load");
+    let mut m = std::collections::BTreeMap::new();
+    for a in &b.actions {
+        m.insert(a.chain_version, a.chain_hash.clone());
+        if let (Some(v), Some(h)) = (a.response_chain_version, &a.response_chain_hash) {
+            m.insert(v, h.clone());
+        }
+    }
+    for e in &b.erasures {
+        m.insert(e.chain_version, e.chain_hash.clone());
+    }
+    for e in &b.events {
+        m.insert(e.chain_version, e.chain_hash.clone());
+    }
+    m
+}
+
+/// Re-seal block `number` over the leaves its range now holds, as a producer
+/// would: root and `actions_count` from the present leaves, optionally with a
+/// new `last_chain_version`. The next block's `prev_block_merkle` follows, so
+/// block linkage stays clean, and the manifest is re-fixed.
+fn reseal_block(dir: &Path, number: i64, new_last: Option<i64>) {
+    let hashes = stored_hashes(dir);
+    let path = dir.join("blocks.jsonl");
+    let original = std::fs::read(&path).expect("read blocks.jsonl");
+    let mut new_root = None;
+    let pass1 = rewrite_rows(&original, |v| {
+        if v["block_number"] == number {
+            if let Some(last) = new_last {
+                v["last_chain_version"] = last.into();
+            }
+            let first = v["first_chain_version"].as_i64().expect("first");
+            let last = v["last_chain_version"].as_i64().expect("last");
+            let leaves: Vec<&str> = hashes
+                .range(first..=last)
+                .map(|(_, h)| h.as_str())
+                .collect();
+            let root = pylae_verify::chain::block_root(&leaves, leaves.len() as u64).expect("root");
+            v["actions_count"] = (leaves.len() as u64).into();
+            v["merkle_root"] = root.clone().into();
+            new_root = Some(root);
+        }
+    });
+    let root = new_root.expect("block exists");
+    let resealed = rewrite_rows(&pass1, |v| {
+        if v["block_number"] == number + 1 {
+            v["prev_block_merkle"] = root.clone().into();
+        }
+    });
+    std::fs::write(&path, &resealed).expect("write blocks.jsonl");
+    refix_manifest(dir, "blocks.jsonl", &resealed);
 }

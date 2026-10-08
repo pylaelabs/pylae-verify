@@ -203,6 +203,23 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(dir: &Path, name: &str) -> Result<Ve
     Ok(out)
 }
 
+/// Files `pylae chain export` always writes (spec §9), other than
+/// `MANIFEST.json` itself.
+const REQUIRED_FILES: [&str; 7] = [
+    "blocks.jsonl",
+    "actions.jsonl",
+    "events.jsonl",
+    "erasures.jsonl",
+    "config_archive.jsonl",
+    "identity.json",
+    "REPORT.md",
+];
+
+/// Files a bundle may lack. `snapshots.jsonl` is absent from bundles
+/// exported before it existed (spec §9); when present it is consumed, so it
+/// must be covered like any other.
+const OPTIONAL_FILES: [&str; 1] = ["snapshots.jsonl"];
+
 impl Bundle {
     /// Load and parse a bundle directory. Fails on any read or parse error.
     pub fn load(dir: &Path) -> Result<Self, String> {
@@ -231,6 +248,29 @@ impl Bundle {
     /// last and is not among its own entries. Returns the list of mismatches.
     pub fn verify_manifest(&self) -> Vec<String> {
         let mut problems = Vec::new();
+
+        // Spec §9: MANIFEST.json covers every other file. A file the
+        // verifier consumes but the manifest does not list is outside the
+        // digest; a required file that is absent would otherwise be read as
+        // empty, and an empty file verifies trivially.
+        let listed: std::collections::HashSet<&str> = self
+            .manifest
+            .files
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        for name in REQUIRED_FILES {
+            if !listed.contains(name) {
+                problems.push(format!(
+                    "{name}: required by spec §9 but not listed in MANIFEST.json"
+                ));
+            }
+        }
+        for name in OPTIONAL_FILES {
+            if self.dir.join(name).exists() && !listed.contains(name) {
+                problems.push(format!("{name}: present but not listed in MANIFEST.json"));
+            }
+        }
         for e in &self.manifest.files {
             if e.name == "MANIFEST.json" {
                 continue;

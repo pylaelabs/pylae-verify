@@ -1,0 +1,4 @@
+# The fixtures are exports whose bytes MANIFEST.json hashes. A checkout that
+# rewrote their line endings (Git for Windows does by default) would make every
+# bundle fail its own manifest.
+tests/fixtures/** -text

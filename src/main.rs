@@ -101,10 +101,17 @@ fn print_report(b: &Bundle, r: &Report) {
         &r.manifest_problems,
     );
     section("chain linkage (no gaps)", &r.linkage_gaps);
-    section(
-        "leaf recomputation (all leaves re-hash)",
-        &r.leaf_mismatches,
-    );
+    let leaf_lines: Vec<String> = r
+        .leaf_mismatches
+        .iter()
+        .cloned()
+        .chain(
+            r.leaves_not_recomputed
+                .iter()
+                .map(|l| format!("{l}: not recomputed")),
+        )
+        .collect();
+    section("leaf recomputation (all leaves re-hash)", &leaf_lines);
     section(
         "Merkle blocks (roots + actions_count binding)",
         &r.block_problems,
@@ -120,9 +127,16 @@ fn print_report(b: &Bundle, r: &Report) {
     section("config anchors (content-addressed)", &r.config_problems);
 
     if r.config_anchors > 0 {
+        // `[ok]` only when every anchor has its row; otherwise the count is
+        // a note, and the rows it lacks are listed under the next heading.
+        let tag = if r.config_anchors_without_row == 0 {
+            "[ok]  "
+        } else {
+            "[note]"
+        };
         println!(
-            "  [ok]   config anchors named by the chain: {} (spec §9.2)",
-            r.config_anchors
+            "  {tag} config anchors named by the chain: {}, {} without a row (spec §9.2)",
+            r.config_anchors, r.config_anchors_without_row
         );
     }
     if !r.config_unresolved.is_empty() {
@@ -150,6 +164,7 @@ fn print_report(b: &Bundle, r: &Report) {
         let issues = r.manifest_problems.len()
             + r.linkage_gaps.len()
             + r.leaf_mismatches.len()
+            + r.leaves_not_recomputed.len()
             + r.block_problems.len()
             + r.tombstone_problems.len()
             + r.snapshot_problems.len()
